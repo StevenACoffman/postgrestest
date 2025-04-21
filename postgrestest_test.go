@@ -26,6 +26,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 const singleTestTime = 30 * time.Second
@@ -38,14 +40,18 @@ func TestStart(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(srv.Cleanup)
-	db, err := sql.Open("postgres", srv.DefaultDatabase())
+	dbconfig, err := pgx.ParseConfig(srv.DefaultDatabase())
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
-	db.SetMaxOpenConns(1)
+	db, err := pgx.ConnectConfig(ctx, dbconfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close(ctx)
+
 	var result int
-	if err := db.QueryRowContext(ctx, "SELECT 1;").Scan(&result); err != nil {
+	if err := db.QueryRow(ctx, "SELECT 1;").Scan(&result); err != nil {
 		t.Fatal("Test query:", err)
 	}
 	if result != 1 {
@@ -63,23 +69,23 @@ func TestNewDatabase(t *testing.T) {
 	t.Cleanup(srv.Cleanup)
 
 	const createTableStmt = `CREATE TABLE foo (id SERIAL PRIMARY KEY);`
-	db1, err := srv.NewDatabase(ctx)
+	db1, err := srv.NewPGXConn(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db1.Close()
-	_, err = db1.ExecContext(ctx, createTableStmt)
+	defer db1.Close(ctx)
+	_, err = db1.Exec(ctx, createTableStmt)
 	if err != nil {
 		t.Fatal("CREATE TABLE in database #1:", err)
 	}
 
-	db2, err := srv.NewDatabase(ctx)
+	db2, err := srv.NewPGXConn(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db2.Close()
+	defer db2.Close(ctx)
 	// If this fails, it likely means that the server is returning the same database.
-	_, err = db2.ExecContext(ctx, createTableStmt)
+	_, err = db2.Exec(ctx, createTableStmt)
 	if err != nil {
 		t.Fatal("CREATE TABLE in database #2:", err)
 	}

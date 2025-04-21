@@ -26,7 +26,6 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"net/url"
 	"os"
 	"os/exec"
@@ -36,19 +35,21 @@ import (
 	"strings"
 	"sync"
 
-	_ "github.com/lib/pq"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5/stdlib"
 )
 
 const superuserName = "postgres"
 
 // A Server represents a running PostgreSQL server.
 type Server struct {
-	dir     string
-	baseURL *url.URL
-	conn    *sql.DB
-
-	exited  <-chan struct{}
-	waitErr error
+	dir        string
+	baseURL    *url.URL
+	connPool   *pgxpool.Pool
+	connConfig *pgxpool.Config
+	exited     <-chan struct{}
+	waitErr    error
 }
 
 // Start starts a PostgreSQL server with an empty database and waits for it to
@@ -59,7 +60,7 @@ type Server struct {
 // the highest version found.
 func Start(ctx context.Context) (_ *Server, err error) {
 	// Prepare data directory.
-	dir, err := ioutil.TempDir("", "postgrestest")
+	dir, err := os.MkdirTemp("", "postgrestest")
 	if err != nil {
 		return nil, fmt.Errorf("start postgres: %w", err)
 	}
@@ -82,7 +83,7 @@ func Start(ctx context.Context) (_ *Server, err error) {
 		"fsync = off\n" +
 		"synchronous_commit = off\n" +
 		"full_page_writes = off\n"
-	err = ioutil.WriteFile(
+	err = os.WriteFile(
 		filepath.Join(dataDir, "postgresql.conf"),
 		[]byte(fmt.Sprintf(configFormat, filepath.ToSlash(dir))),
 		0666)
@@ -122,8 +123,16 @@ func Start(ctx context.Context) (_ *Server, err error) {
 		srv.waitErr = proc.Wait()
 	}()
 
-	// Wait for server to come up healthy.
-	srv.conn, err = sql.Open("postgres", srv.DefaultDatabase())
+	srv.connConfig, err = pgxpool.ParseConfig(srv.DefaultDatabase())
+	if err != nil {
+		// Failure to open means the DSN is invalid. Connections aren't created
+		// until we ping.
+		srv.stop()
+		return nil, fmt.Errorf("start postgres: %w", err)
+	}
+	srv.connConfig.MaxConns = 1
+
+	srv.connPool, err = pgxpool.NewWithConfig(ctx, srv.connConfig)
 	if err != nil {
 		// Failure to open means the DSN is invalid. Connections aren't created
 		// until we ping.
@@ -132,21 +141,22 @@ func Start(ctx context.Context) (_ *Server, err error) {
 	}
 	defer func() {
 		if err != nil {
-			srv.conn.Close()
+			srv.connPool.Close()
 		}
 	}()
-	srv.conn.SetMaxOpenConns(1)
+
+	// Wait for server to come up healthy.
 	for {
 		select {
 		case <-ctx.Done():
 			srv.stop()
-			logOutput, _ := ioutil.ReadFile(logFile)
+			logOutput, _ := os.ReadFile(logFile)
 			if len(logOutput) == 0 {
 				return nil, fmt.Errorf("start postgres: %w", ctx.Err())
 			}
 			return nil, fmt.Errorf("start postgres: %w\n%s", ctx.Err(), logOutput)
 		default:
-			if err := srv.conn.PingContext(ctx); err == nil {
+			if err := srv.connPool.Ping(ctx); err == nil {
 				return srv, nil
 			}
 		}
@@ -173,13 +183,68 @@ func (srv *Server) dsn(dbName string) string {
 	return dsnString(&u)
 }
 
-// NewDatabase opens a connection to a freshly created database on the server.
-func (srv *Server) NewDatabase(ctx context.Context) (*sql.DB, error) {
+// NewPGXPool opens a connection pool to a freshly created database on the server.
+func (srv *Server) NewPGXPool(ctx context.Context) (*pgxpool.Pool, error) {
 	dsn, err := srv.CreateDatabase(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return sql.Open("postgres", dsn)
+	connConfig, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		// Failure to open means the DSN is invalid. Connections aren't created
+		// until we ping.
+		return nil, fmt.Errorf("start postgres: %w", err)
+	}
+	connConfig.MaxConns = 1
+
+	connPool, err := pgxpool.NewWithConfig(ctx, connConfig)
+	if err != nil {
+		// Failure to open means the DSN is invalid. Connections aren't created
+		// until we ping.
+		return nil, fmt.Errorf("start postgres: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			connPool.Close()
+		}
+	}()
+	return connPool, err
+}
+
+// NewDatabaseDB opens a connection to a freshly created database on the server.
+func (srv *Server) NewDatabaseDB(ctx context.Context) (*sql.DB, error) {
+	connPool, err := srv.NewPGXPool(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return stdlib.OpenDBFromPool(connPool), nil
+}
+
+// NewPGXConn opens a connection to a freshly created database on the server.
+func (srv *Server) NewPGXConn(ctx context.Context) (*pgx.Conn, error) {
+	dsn, err := srv.CreateDatabase(ctx)
+	if err != nil {
+		return nil, err
+	}
+	connConfig, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		// Failure to open means the DSN is invalid. Connections aren't created
+		// until we ping.
+		return nil, fmt.Errorf("start postgres: %w", err)
+	}
+
+	conn, err := pgx.ConnectConfig(ctx, connConfig)
+	if err != nil {
+		// Failure to open means the DSN is invalid.
+		// Connections aren't created until we ping.
+		return nil, fmt.Errorf("start postgres: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			conn.Close(ctx)
+		}
+	}()
+	return conn, err
 }
 
 // CreateDatabase creates a new database on the server and returns its
@@ -189,7 +254,7 @@ func (srv *Server) CreateDatabase(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("new database: %w", err)
 	}
-	_, err = srv.conn.ExecContext(ctx, "CREATE DATABASE \""+dbName+"\";")
+	_, err = srv.connPool.Exec(ctx, "CREATE DATABASE \""+dbName+"\";")
 	if err != nil {
 		return "", fmt.Errorf("new database: %w", err)
 	}
@@ -198,8 +263,8 @@ func (srv *Server) CreateDatabase(ctx context.Context) (string, error) {
 
 // Cleanup shuts down the server and deletes any on-disk files the server used.
 func (srv *Server) Cleanup() {
-	if srv.conn != nil {
-		srv.conn.Close()
+	if srv.connPool != nil {
+		srv.connPool.Close()
 	}
 	srv.stop()
 	os.RemoveAll(srv.dir)
@@ -247,7 +312,7 @@ func findPostgresBin() {
 	if runtime.GOOS == "windows" {
 		dir = `C:\Program Files\PostgreSQL`
 	}
-	listing, err := ioutil.ReadDir(dir)
+	listing, err := os.ReadDir(dir)
 	if err != nil {
 		return
 	}

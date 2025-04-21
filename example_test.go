@@ -37,22 +37,22 @@ func Example() {
 
 	// Each of your subtests can have their own database:
 	t.Run("Test1", func(t *testing.T) {
-		db, err := srv.NewDatabase(ctx)
+		db, err := srv.NewPGXConn(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := db.Exec(`CREATE TABLE foo (id SERIAL PRIMARY KEY);`); err != nil {
+		if _, err := db.Exec(ctx, `CREATE TABLE foo (id SERIAL PRIMARY KEY);`); err != nil {
 			t.Fatal(err)
 		}
 		// ...
 	})
 
 	t.Run("Test2", func(t *testing.T) {
-		db, err := srv.NewDatabase(ctx)
+		db, err := srv.NewPGXConn(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := db.Exec(`CREATE TABLE foo (id SERIAL PRIMARY KEY);`); err != nil {
+		if _, err := db.Exec(ctx, `CREATE TABLE foo (id SERIAL PRIMARY KEY);`); err != nil {
 			t.Fatal(err)
 		}
 		// ...
